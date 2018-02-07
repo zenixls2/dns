@@ -73,12 +73,12 @@ func NewHeader() (h *Header) {
 	return &Header{}
 }
 
-func (h *Header) Unmarshal(msg []byte, h *Header) (n int, err error) {
+func (h *Header) Unmarshal(msg []byte) (n int, err error) {
 	if h == nil {
 		h = &Header{}
 	}
 	if len(msg) != 12 {
-		err = fmt.Erorrf("msg doesn't have expected size %d", len(msg))
+		err = fmt.Errorf("msg doesn't have expected size %d", len(msg))
 		return
 	}
 	var highbyte, lowbyte byte
@@ -90,7 +90,7 @@ func (h *Header) Unmarshal(msg []byte, h *Header) (n int, err error) {
 	h.AA = (highbyte >> 2) & 0x1
 	h.Opcode = (highbyte >> 3) & 0xF
 	h.QR = (highbyte >> 7) & 0x1
-	h.RCCODE = lowbyte & 0xF
+	h.RCODE = lowbyte & 0xF
 	h.Z = (lowbyte >> 4) & 0xF
 	h.RA = (lowbyte >> 7) & 0x1
 	h.QDCOUNT = uint16(msg[5]) | (uint16(msg[4]) << 8)
@@ -196,8 +196,8 @@ func (q *Question) Unmarshal(msg []byte) (index int, err error) {
 		size = int(msg[index])
 		// compression check and extraction
 		if size&0xB0 == 0xB0 {
-			offset = size & 0x3F
-			r.NAME = append(r.NAME, r.NAME[offset])
+			offset := size & 0x3F
+			q.QNAME = append(q.QNAME, q.QNAME[offset])
 			index += 1
 			continue
 		}
@@ -237,12 +237,12 @@ func (q *Question) Marshal() (result []byte, err error) {
 			return
 		}
 		result = append(result, byte(length))
-		result = append(result, name)
+		result = append(result, name...)
 	}
-	result = append(result, []byte{
-		byte(q.QTYPE >> 8), byte(q.QTYPE),
-		byte(q.QCLASS >> 8), byte(q.QCLASS),
-	})
+	result = append(result,
+		byte(q.QTYPE>>8), byte(q.QTYPE),
+		byte(q.QCLASS>>8), byte(q.QCLASS),
+	)
 	return
 }
 
@@ -319,15 +319,15 @@ func (r *RR) Unmarshal(msg []byte) (index int, err error) {
 	r.CLASS = uint16(msg[index+3]) | (uint16(msg[index+2]) << 8)
 	r.TTL = (int32(msg[index+4]) << 24) | (int32(msg[index+5]) << 16) | (int32(msg[index+6]) << 8) | int32(msg[index+7])
 	r.RDLENGTH = (uint16(msg[index+8]) << 8) | uint16(msg[index+9])
-	r.RDATA = msg[index+10 : index+10+r.RDLENGTH]
-	index += 11 + r.RDLENGTH
+	r.RDATA = msg[index+10 : index+10+int(r.RDLENGTH)]
+	index += 11 + int(r.RDLENGTH)
 	return
 }
 
-func (r *RR) Marshal() (result []byte) {
+func (r *RR) Marshal() (result []byte, err error) {
 	result = make([]byte, 0, 12)
 	for _, name := range r.NAME {
-		length = len(name)
+		length := len(name)
 		if length == 0 {
 			err = fmt.Errorf("cannot have empty label")
 			return
@@ -339,21 +339,99 @@ func (r *RR) Marshal() (result []byte) {
 		}
 		// no support compression currently
 		result = append(result, byte(length))
-		result = append(result, name)
+		result = append(result, name...)
 	}
-	result = append(result, []byte{
-		byte(r.TYPE >> 8), byte(r.TYPE),
-		byte(r.CLASS >> 8), byte(r.CLASS),
-		byte(r.TTL >> 24), byte(r.TTL >> 16),
-		byte(r.TTL >> 8), byte(r.TTL),
-		byte(r.RDLENGTH >> 8), byte(r.RDLENGTH),
-	})
-	result = append(result, r.RDATA)
+	result = append(result,
+		byte(r.TYPE>>8), byte(r.TYPE),
+		byte(r.CLASS>>8), byte(r.CLASS),
+		byte(r.TTL>>24), byte(r.TTL>>16),
+		byte(r.TTL>>8), byte(r.TTL),
+		byte(r.RDLENGTH>>8), byte(r.RDLENGTH),
+	)
+	result = append(result, r.RDATA...)
 	return
 }
 
 type Message struct {
 	Header
-	Questions []*Question
-	Answers   []*RR
+	Questions   []*Question
+	Answers     []*RR
+	NameServers []*RR
+	Additional  []*RR
+}
+
+func (dns *Message) Unmarshal(msg []byte) (err error) {
+	index := 0
+	offset, err := dns.Header.Unmarshal(msg[index:len(msg)])
+	if err != nil {
+		return
+	}
+	index += offset
+	dns.Questions = nil
+	var q *Question
+	for i := 0; i < int(dns.Header.QDCOUNT); i++ {
+		q = NewQuestion()
+		offset, err = q.Unmarshal(msg[index:len(msg)])
+		// the QDCOUNT value is fake
+		if offset == 0 {
+			dns.Header.QDCOUNT = uint16(i)
+			break
+		}
+		if err != nil {
+			return
+		}
+		dns.Questions = append(dns.Questions, q)
+		index += offset
+	}
+
+	dns.Answers = nil
+	for i := 0; i < int(dns.Header.ANCOUNT); i++ {
+		var a *RR
+		a = NewRR()
+		offset, err = a.Unmarshal(msg[index:len(msg)])
+		// the ANCOUNT value is fake
+		if offset == 0 {
+			dns.Header.ANCOUNT = uint16(i)
+			break
+		}
+		if err != nil {
+			return
+		}
+		dns.Answers = append(dns.Answers, a)
+		index += offset
+	}
+
+	dns.NameServers = nil
+	for i := 0; i < int(dns.Header.NSCOUNT); i++ {
+		var ns *RR
+		ns = NewRR()
+		offset, err = ns.Unmarshal(msg[index:len(msg)])
+		// the NSCOUNT value is fake
+		if offset == 0 {
+			dns.Header.NSCOUNT = uint16(i)
+			break
+		}
+		if err != nil {
+			return
+		}
+		dns.NameServers = append(dns.NameServers, ns)
+		index += offset
+	}
+
+	dns.Additional = nil
+	for i := 0; i < int(dns.Header.ARCOUNT); i++ {
+		var ar *RR
+		ar = NewRR()
+		offset, err = ar.Unmarshal(msg[index:len(msg)])
+		// the ARCOUNT value is fake
+		if offset == 0 {
+			dns.Header.ARCOUNT = uint16(i)
+		}
+		if err != nil {
+			return
+		}
+		dns.Additional = append(dns.Additional, ar)
+		index += offset
+	}
+	return
 }
